@@ -1,14 +1,13 @@
 package com.github.mdjc.videogenerator;
 
-import java.awt.image.BufferedImage;
-import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileFilter;
 import java.io.FileNotFoundException;
-import java.io.FileWriter;
 import java.io.IOException;
-
-import javax.imageio.ImageIO;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.commons.io.FileUtils;
 import org.slf4j.Logger;
@@ -17,22 +16,14 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import com.github.mdjc.common.Utils;
-import com.github.mdjc.videogenerator.helpers.ImageHelper;
-import com.github.mdjc.videogenerator.helpers.MediaHelper;
 
 @Component
 public class AppRunner {
 	private static final Logger LOGGER = LoggerFactory.getLogger(AppRunner.class);
-
-	private static final FileFilter MP3_FILTER = pathname -> pathname.isFile()
-			&& pathname.getName().toLowerCase().endsWith(".mp3");
-
 	private static final FileFilter DIRECTORY_FILTER = pathname -> pathname.isDirectory();
 
-	private static final int HTML_FONT_SIZE = 6;
-	private static final int HTML_WRAP_WIDTH = 600;
-	private static final int MP3_REPETION_COUNT = 5;
-	private static final int INITIAL_PAUSE_SECONDS = 0;
+	private static final int N_THREADS = Runtime.getRuntime().availableProcessors();
+	private static final int CAPACITY = 800;
 
 	@Value("${input.dir}")
 	private File inputDir;
@@ -45,14 +36,17 @@ public class AppRunner {
 
 	private File tempDir;
 
-	private File oneSecSilentMP3File;
-	private int videoCount = -1;
+	private AtomicInteger videoCount;
+	private ThreadPoolExecutor executor;
 
 	public void run() throws IOException, InterruptedException {
-		tempDir = new File(outputDir, "temp");
+		long startTime = System.nanoTime();
+		executor = new ThreadPoolExecutor(N_THREADS + 1, N_THREADS + 1, 0L, TimeUnit.MILLISECONDS,
+				new LinkedBlockingQueue<>(CAPACITY));
+		executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
 
-		// TODO: copy mp3 in a temp folder and move it to java resources
-		oneSecSilentMP3File = new File("resources\\1sec.mp3");
+		videoCount = new AtomicInteger(-1);
+		tempDir = new File(outputDir, "temp");
 
 		if (tempDir.exists()) {
 			FileUtils.deleteDirectory(tempDir);
@@ -70,7 +64,13 @@ public class AppRunner {
 			proccessSubjectDir(subjectDir);
 		}
 
-		LOGGER.info("Video count is {} ", videoCount);
+		executor.shutdown();
+		executor.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
+		LOGGER.info("Video count is {} ", videoCount.get());
+		long estimatedTime = System.nanoTime() - startTime;
+		System.out
+				.println(String.format("Completed all activities with %d threads, in %f", executor.getMaximumPoolSize(),
+						estimatedTime / 1000000000.0));
 		LOGGER.info("The end");
 	}
 
@@ -84,95 +84,17 @@ public class AppRunner {
 		String title = Utils.readContents(new File(sectionDir, "title.txt"));
 		for (File lessonDir : sectionDir.listFiles(DIRECTORY_FILTER)) {
 			try {
-				videoCount++;
 				if (outputOnlyAudio) {
-					processLessonDirOnlyAudio(lessonDir, title);
+					executor.execute(
+							new CreateLessonAudioTask(videoCount.incrementAndGet(), title, lessonDir, outputDir));
 					continue;
 				}
 
-				processLessonDir(lessonDir, title);
+				executor.execute(new CreateLessonVideoTask(videoCount.incrementAndGet(), title, lessonDir, outputDir));
 			} catch (Exception e) {
 				LOGGER.error("Error processing lesson", e);
 			}
 
-		}
-	}
-
-	private void processLessonDir(File lessonDir, String sectionTitle) throws IOException, InterruptedException {
-		LOGGER.info("Processing Lesson {}", lessonDir);
-		File image = generateImage(lessonDir);
-		String mergedAudioBasename = String.format("video%d_merge.wav", videoCount);
-		File mergedAudioFile = generateMergedAudioFile(lessonDir, new File(tempDir, mergedAudioBasename));
-		String prefix = String.format("%03d_%s", videoCount, sectionTitle);
-		MediaHelper.generateVideo(image, mergedAudioFile, prefix, outputDir);
-	}
-
-	private void processLessonDirOnlyAudio(File lessonDir, String sectionTitle) throws IOException,
-			InterruptedException {
-		LOGGER.info("Processing Lesson {}", lessonDir);
-		String mergedAudioBasename = String.format("%d_%s.wav", videoCount, sectionTitle);
-		generateMergedAudioFile(lessonDir, new File(outputDir, mergedAudioBasename));
-	}
-
-	private File generateImage(File lessonDir) throws FileNotFoundException, IOException {
-		LOGGER.info("generating image from htmlfile");
-		File htmlFile = new File(lessonDir, "body.html");
-		String html = Utils.readContents(htmlFile);
-		String imageName = String.format("video%d", videoCount);
-		File imageFile = ImageHelper.generatePNG(tempDir, imageName, html, HTML_FONT_SIZE, HTML_WRAP_WIDTH);
-		BufferedImage buffImg = ImageIO.read(imageFile);
-		BufferedImage scaledImage = ImageHelper.resizeDivisibleBy2(buffImg);
-		return ImageHelper.save(scaledImage, imageFile);
-	}
-
-	private File generateMergedAudioFile(File lessonDir, File outputFile) throws IOException, InterruptedException {
-		LOGGER.info("generating merged audio file");
-		File audioListFile = generateAudioListFile(lessonDir);
-		return MediaHelper.generateMergedAudio(audioListFile, outputFile);
-	}
-
-	private File generateAudioListFile(File lessonDir) throws IOException, InterruptedException {
-		LOGGER.info("generating audio list file");
-		String audioListBasename = String.format("video%d_audio_list.txt", videoCount);
-		File audioListFile = new File(tempDir, audioListBasename);
-
-		try (BufferedWriter bw = new BufferedWriter(new FileWriter(audioListFile))) {
-			addAudioEntry(bw, oneSecSilentMP3File, INITIAL_PAUSE_SECONDS);
-			int mp3Count = 0;
-
-			for (File lessonFile : lessonDir.listFiles(MP3_FILTER)) {
-				processMp3File(bw, lessonFile, mp3Count++);
-			}
-
-			bw.flush();
-		}
-
-		return audioListFile;
-	}
-
-	private void processMp3File(BufferedWriter bw, File file, int mp3Count) throws IOException, InterruptedException {
-		LOGGER.info("processing mp3 file");
-		File muteMp3 = generateMuteMp3(file, mp3Count);
-
-		for (int i = 0; i < MP3_REPETION_COUNT; i++) {
-			addAudioEntry(bw, file, 1);
-			addAudioEntry(bw, muteMp3, 2);
-		}
-	}
-
-	private File generateMuteMp3(File file, int mp3Count) throws IOException, InterruptedException {
-		LOGGER.info("generating mute mp3 file");
-		String muteBasename = String.format("video%d_mute%d.mp3", videoCount, mp3Count);
-		File muteMp3 = new File(tempDir, muteBasename);
-		MediaHelper.generateMuteAudio(file, muteMp3);
-		return muteMp3;
-	}
-
-	private static void addAudioEntry(BufferedWriter bw, File audioFile, int times) throws IOException {
-		for (int i = 0; i < times; i++) {
-			String entry = String.format("file '%s'", audioFile.getPath());
-			bw.write(entry);
-			bw.newLine();
 		}
 	}
 }
